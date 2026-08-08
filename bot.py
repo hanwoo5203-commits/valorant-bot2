@@ -515,8 +515,41 @@ async def reset_all_stats_1v1(ctx):
 
 
 # =========================================================
-# --- [ 공통 관리자 및 차단 내역 명령어 ] ---
+# --- [ 공통 관리자, 청소 및 차단 내역 명령어 ] ---
 # =========================================================
+
+
+@bot.command(name="청소", aliases=["삭제"])
+@commands.has_permissions(administrator=True)
+async def clear_messages(ctx, count: int = 10):
+  """고정된 메시지를 스킵하고 지정한 개수만큼 일반 메시지를 삭제합니다.
+
+  사용법: !청소 20
+  """
+  await ctx.message.delete()
+
+  deleted_count = 0
+  pinned_messages = await ctx.channel.pins()
+  pinned_ids = [m.id for m in pinned_messages]
+
+  # 최근 메시지를 스캔하며 고정 안 된 메시지만 삭제
+  async for message in ctx.channel.history(limit=count * 2):
+    if message.id not in pinned_ids:
+      try:
+        await message.delete()
+        deleted_count += 1
+        await asyncio.sleep(0.3)
+      except discord.NotFound:
+        pass
+
+    if deleted_count >= count:
+      break
+
+  notice = await ctx.send(
+      f"🧹 고정 메시지를 제외하고 **{deleted_count}개**의 메시지를 정돈했습니다!"
+  )
+  await asyncio.sleep(3)
+  await notice.delete()
 
 
 @bot.command(name="차단")
