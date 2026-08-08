@@ -167,4 +167,7 @@ async def 초기화(ctx):
     is_open = False
     await ctx.send("🔄 대기열 및 모집 상태가 초기화되었습니다.")
 
-bot.run("MTUzNTYwNjE3MDIwMTQ5NzYyMA.GzCurZ.gpl-e5tL5yUkq6udCxShhkrKrqSgbWTBbngSYE")
+import os
+
+TOKEN = os.environ.get("DISCORD_TOKEN")
+bot.run(TOKEN)
