@@ -1,9 +1,10 @@
 import asyncio
+import datetime
 import os
 import random
 from threading import Thread
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 
 # --- [1. Render 24시간 유지를 위한 Flask 웹서버 설정] ---
@@ -36,6 +37,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 5v5 내전 데이터 (주전 10명 + 예비 5명 = 총 15명)
 queue_5v5 = []
 is_open_5v5 = False
+reserved_time_5v5 = None  # 예약 시간 HH:MM
+reserved_channel_5v5 = None  # 예약을 실행한 채널
 
 # 1v1 내전 데이터 (개인 참가 대기열)
 queue_1v1 = []
@@ -69,9 +72,44 @@ def get_tier_info(wins: int):
     return "⚙️ 아이언"
 
 
+# --- [ 백그라운드 예약 시각 체크 루프 ] ---
+@tasks.loop(seconds=30)
+async def check_reservation_loop():
+  global is_open_5v5, reserved_time_5v5, reserved_channel_5v5
+  if reserved_time_5v5 is None:
+    return
+
+  # 한국 표준시(KST = UTC+9) 계산
+  now_kst = datetime.datetime.now(
+      datetime.timezone(datetime.timedelta(hours=9))
+  )
+  current_time_str = now_kst.strftime("%H:%M")
+
+  if current_time_str == reserved_time_5v5:
+    is_open_5v5 = True
+    target_channel = reserved_channel_5v5
+
+    # 예약 변수 초기화
+    reserved_time_5v5 = None
+    reserved_channel_5v5 = None
+
+    if target_channel:
+      await target_channel.send(
+          "🚨 **[5v5 선착순 모집 시작]** 약속된 시간이 되었습니다! 지금부터 `!참가`"
+          " 명령어를 입력하세요!"
+      )
+
+
+@check_reservation_loop.before_loop
+async def before_check():
+  await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
   print(f"{bot.user.name} 봇이 준비되었습니다!")
+  if not check_reservation_loop.is_running():
+    check_reservation_loop.start()
 
 
 # =========================================================
@@ -165,10 +203,37 @@ async def open_5v5(ctx):
   )
 
 
+@bot.command(name="예약시간")
+@commands.has_permissions(administrator=True)
+async def reserve_time_5v5(ctx, time_str: str):
+  """사용법: !예약시간 15:00 (원하는 24시간제 시각 지정)"""
+  global reserved_time_5v5, reserved_channel_5v5
+  try:
+    hour, minute = map(int, time_str.split(":"))
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+      raise ValueError
+
+    reserved_time_5v5 = f"{hour:02d}:{minute:02d}"
+    reserved_channel_5v5 = ctx.channel
+    await ctx.send(
+        f"⏰ **[5v5 모집 예약 완료]** 오늘 **{reserved_time_5v5}**에 자동으로 모집이"
+        " 시작됩니다!"
+    )
+  except ValueError:
+    await ctx.send("⚠️ 올바른 시간 형식이 아닙니다! 예: `!예약시간 15:00` (24시간제)")
+
+
 @bot.command(name="예약")
 @commands.has_permissions(administrator=True)
-async def reserve_5v5(ctx, seconds: int):
+async def reserve_seconds_5v5(ctx, seconds: int):
+  """짧은 대기시간(초 단위) 예약용 명령어"""
   global is_open_5v5
+  if seconds > 3600:
+    await ctx.send(
+        "⚠️ 1시간(3600초) 이상의 긴 예약은 `!예약시간 HH:MM` 명령어를 사용하는 것이"
+        " 안전합니다!"
+    )
+
   await ctx.send(
       f"⏳ **{seconds}초 후**에 5v5 모집이 시작됩니다! 준비하세요!"
   )
@@ -177,6 +242,15 @@ async def reserve_5v5(ctx, seconds: int):
   await ctx.send(
       "🚨 **[5v5 선착순 모집 시작]** 지금부터 `!참가` 명령어를 입력하세요!"
   )
+
+
+@bot.command(name="예약취소")
+@commands.has_permissions(administrator=True)
+async def cancel_reservation_5v5(ctx):
+  global reserved_time_5v5, reserved_channel_5v5
+  reserved_time_5v5 = None
+  reserved_channel_5v5 = None
+  await ctx.send("❌ 5v5 모집 예약이 취소되었습니다.")
 
 
 @bot.command(name="마감")
@@ -190,10 +264,12 @@ async def close_5v5(ctx):
 @bot.command(name="초기화")
 @commands.has_permissions(administrator=True)
 async def reset_5v5(ctx):
-  global queue_5v5, is_open_5v5
+  global queue_5v5, is_open_5v5, reserved_time_5v5, reserved_channel_5v5
   queue_5v5 = []
   is_open_5v5 = False
-  await ctx.send("🔄 5v5 대기열 및 모집 상태가 초기화되었습니다.")
+  reserved_time_5v5 = None
+  reserved_channel_5v5 = None
+  await ctx.send("🔄 5v5 대기열 및 모집/예약 상태가 초기화되었습니다.")
 
 
 # =========================================================
