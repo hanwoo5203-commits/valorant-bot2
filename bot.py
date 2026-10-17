@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import itertools
+import json
 import os
 import random
 from threading import Thread
@@ -32,40 +33,82 @@ keep_alive()
 # --- [2. 디스코드 봇 기본 설정] ---
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- [ 데이터 저장 구조 ] ---
-# 5v5 내전 데이터
+# --- [ 데이터 저장 구조 (JSON) ] ---
+DATA_FILE = "data.json"
+
+
+def load_data():
+  if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+      return json.load(f)
+  return {"users": {}, "shop": {}, "user_stocks": {}}
+
+
+def save_data(data):
+  with open(DATA_FILE, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+data = load_data()
+
+
+def get_user_data(user_id):
+  user_str = str(user_id)
+  if user_str not in data["users"]:
+    data["users"][user_str] = {
+        "points": 0,
+        "inventory": [],
+        "last_checkin": "",  # YYYY-MM-DD 출석 체크용
+    }
+    save_data(data)
+  elif "last_checkin" not in data["users"][user_str]:
+    data["users"][user_str]["last_checkin"] = ""
+    save_data(data)
+  return data["users"][user_str]
+
+
+def get_user_points(user_id):
+  return get_user_data(user_id)["points"]
+
+
+def update_user_points(user_id, amount):
+  user_str = str(user_id)
+  get_user_data(user_id)
+  data["users"][user_str]["points"] += amount
+  save_data(data)
+  return data["users"][user_str]["points"]
+
+
+# --- 기존 내전 및 전역 관리 데이터 ---
 queue_5v5 = []
 is_open_5v5 = False
 reserved_time_5v5 = None
 reserved_channel_5v5 = None
 
-# 1v1 내전 데이터
 queue_1v1 = []
 is_open_1v1 = False
 last_bracket_embed = None
 
-# ⚽ 피파온라인 내전 데이터
-queue_fifa = []  # 등록된 전체 유저 명단
-fifa_winners = []  # 현재 라운드 진출자 명단
-current_tournament_round = 0  # 0: 조별리그, 16/8/4/2: 토너먼트 진행 중
+queue_fifa = []
+fifa_winners = []
+current_tournament_round = 0
 last_fifa_group_embed = None
-
-# ⚽ 토너먼트 매치 세트 승수 저장 { "유저이름": 토너먼트내 세트 승수 }
 tournament_match_wins = {}
-
-# ⚽ 조별리그 데이터 { "A조": ["유저1", "유저2"] }
 fifa_groups = {}
-
-# ⚽ 피파온라인 유저별 통계 (승점/득실)
 fifa_stats = {}
-
-# 1v1 유저 전적 저장 데이터 { user_id: win_count }
 user_wins_1v1 = {}
-
-# 차단 유저 정보 { user_id: {"name": str, "reason": str} }
 banned_users = {}
+
+# --- 주식 시스템 데이터 (30초마다 변동) ---
+stock_data = {
+    "SK다우닉스": {"price": 300000, "surge_timer": 0},
+    "야건식품": {"price": 3000, "surge_timer": 0},
+    "야멧돼농협": {"price": 50000, "surge_timer": 0},
+}
 
 
 def get_tier_info(wins: int):
@@ -101,47 +144,425 @@ def get_or_init_fifa_stat(name: str):
   return fifa_stats[name]
 
 
+# ==========================================
+# 백그라운드 루프 (예약 및 주식 30초 자동 변동)
+# ==========================================
 @tasks.loop(seconds=30)
-async def check_reservation_loop():
-  global is_open_5v5, reserved_time_5v5, reserved_channel_5v5
-  if reserved_time_5v5 is None:
-    return
+async def background_loop():
+  global is_open_5v5, reserved_time_5v5, reserved_channel_5v5, stock_data
 
-  now_kst = datetime.datetime.now(
-      datetime.timezone(datetime.timedelta(hours=9))
-  )
-  current_time_str = now_kst.strftime("%H:%M")
+  # 1. 5v5 예약 체크
+  if reserved_time_5v5 is not None:
+    now_kst = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=9))
+    )
+    current_time_str = now_kst.strftime("%H:%M")
+    if current_time_str == reserved_time_5v5:
+      is_open_5v5 = True
+      target_channel = reserved_channel_5v5
+      reserved_time_5v5 = None
+      reserved_channel_5v5 = None
+      if target_channel:
+        await target_channel.send(
+            "🚨 **[5v5 선착순 모집 시작]** 약속된 시간이 되었습니다! 지금부터 `!참가`"
+            " 명령어를 입력하세요!"
+        )
 
-  if current_time_str == reserved_time_5v5:
-    is_open_5v5 = True
-    target_channel = reserved_channel_5v5
-    reserved_time_5v5 = None
-    reserved_channel_5v5 = None
+  # 2. 주식 가격 변동 시스템 (30초마다 갱신)
+  # - SK다우닉스: 30만원 시작, 완만 변동, 아주 가끔 20만원까지 급락 후 복구
+  sk = stock_data["SK다우닉스"]
+  if sk["surge_timer"] > 0:
+    sk["surge_timer"] -= 1
+    if sk["surge_timer"] == 0:
+      sk["price"] = random.randint(280000, 320000)
+  else:
+    if random.randint(1, 40) == 1:
+      sk["price"] = random.randint(200000, 220000)
+      sk["surge_timer"] = 3
+    else:
+      change = random.randint(-4000, 4000)
+      sk["price"] = max(180000, min(350000, sk["price"] + change))
 
-    if target_channel:
-      await target_channel.send(
-          "🚨 **[5v5 선착순 모집 시작]** 약속된 시간이 되었습니다! 지금부터 `!참가`"
-          " 명령어를 입력하세요!"
-      )
+  # - 야건식품: 3000원 시작, 아주 가끔 1분 정도(2턴) 16만~42만원 치솟음
+  yg = stock_data["야건식품"]
+  if yg["surge_timer"] > 0:
+    yg["surge_timer"] -= 1
+    if yg["surge_timer"] == 0:
+      yg["price"] = random.randint(3000, 5000)
+  else:
+    if random.randint(1, 60) == 1:
+      yg["price"] = random.randint(160000, 420000)
+      yg["surge_timer"] = 2
+    else:
+      change = random.randint(-300, 500)
+      yg["price"] = max(2000, min(6000, yg["price"] + change))
+
+  # - 야멧돼농협: 5만원대, 1만~14만원 사이에서 폭등/폭락 반복
+  ym = stock_data["야멧돼농협"]
+  change = random.randint(-15000, 15000)
+  ym["price"] = max(10000, min(140000, ym["price"] + change))
 
 
-@check_reservation_loop.before_loop
-async def before_check():
+@background_loop.before_loop
+async def before_bg():
   await bot.wait_until_ready()
 
 
 @bot.event
 async def on_ready():
   print(f"{bot.user.name} 봇이 준비되었습니다!")
-  if not check_reservation_loop.is_running():
-    check_reservation_loop.start()
+  if not background_loop.is_running():
+    background_loop.start()
+
+
+# ==========================================
+# 0. 출석체크, 포인트, 상점 및 도박 시스템 (신규 추가)
+# ==========================================
+@bot.command(name="출석", aliases=["출석체크", "출체"])
+async def daily_checkin(ctx):
+  """[일반] 매일 1회 출석하여 10,000 포인트를 획득합니다."""
+  user_id = ctx.author.id
+  user_info = get_user_data(user_id)
+
+  today_str = (
+      datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+  ).strftime("%Y-%m-%d")
+
+  if user_info.get("last_checkin") == today_str:
+    await ctx.send(
+        f"❌ {ctx.author.mention}님, 오늘은 이미 출석체크를 완료하셨습니다! 내일 다시"
+        " 시도해 주세요."
+    )
+    return
+
+  reward = 10000
+  user_info["last_checkin"] = today_str
+  new_bal = update_user_points(user_id, reward)
+
+  await ctx.send(
+      f"📅 **[출석 완료]** {ctx.author.mention}님, 오늘 출석 보상으로"
+      f" **{reward:,}P**를 받으셨습니다! 🎉\n현재 잔액: **{new_bal:,}P**"
+  )
+
+
+@bot.command(name="포인트지급")
+@commands.has_permissions(administrator=True)
+async def give_points(ctx, member: discord.Member, amount: int):
+  """[관리자] 유저에게 포인트를 지급합니다."""
+  new_bal = update_user_points(member.id, amount)
+  await ctx.send(
+      f"🪙 {member.mention}님에게 **{amount:,}P**를 지급했습니다. (현재 잔액:"
+      f" **{new_bal:,}P**)"
+  )
+
+
+@bot.command(name="포인트차감")
+@commands.has_permissions(administrator=True)
+async def remove_points(ctx, member: discord.Member, amount: int):
+  """[관리자] 유저의 포인트를 차감합니다."""
+  new_bal = update_user_points(member.id, -amount)
+  await ctx.send(
+      f"📉 {member.mention}님의 포인트를 **{amount:,}P** 차감했습니다. (현재 잔액:"
+      f" **{new_bal:,}P**)"
+  )
+
+
+@bot.command(name="포인트확인", aliases=["포인트", "잔액", "지갑"])
+async def check_points(ctx, member: discord.Member = None):
+  """자신 또는 타인의 포인트를 확인합니다."""
+  target = member or ctx.author
+  pts = get_user_points(target.id)
+  await ctx.send(f"💳 {target.mention}님의 현재 포인트: **{pts:,}P**")
+
+
+@bot.command(name="상점")
+async def show_shop(ctx):
+  """현재 상점 상품 목록을 조회합니다."""
+  shop = data.get("shop", {})
+  if not shop:
+    await ctx.send("🏪 현재 등록된 상점 상품이 없습니다. 관리자에게 문의하세요!")
+    return
+
+  embed = discord.Embed(title="🏪 포인트 상점", color=discord.Color.gold())
+  for item_name, price in shop.items():
+    embed.add_field(
+        name=f"📦 {item_name}", value=f"가격: **{price:,}P**", inline=False
+    )
+  embed.set_footer(text="구매 시 '!구매 [상품명]' 명령어를 사용하세요.")
+  await ctx.send(embed=embed)
+
+
+@bot.command(name="상점추가")
+@commands.has_permissions(administrator=True)
+async def add_shop_item(ctx, item_name: str, price: int):
+  """[관리자] 상점에 새 상품을 추가합니다."""
+  data["shop"][item_name] = price
+  save_data(data)
+  await ctx.send(
+      f"✅ 상점에 **[{item_name}]** (가격: **{price:,}P**) 상품이 추가되었습니다."
+  )
+
+
+@bot.command(name="상점삭제")
+@commands.has_permissions(administrator=True)
+async def remove_shop_item(ctx, item_name: str):
+  """[관리자] 상점에서 상품을 삭제합니다."""
+  if item_name in data["shop"]:
+    del data["shop"][item_name]
+    save_data(data)
+    await ctx.send(f"🗑️ 상점에서 **[{item_name}]** 상품이 삭제되었습니다.")
+  else:
+    await ctx.send("❌ 해당 상품이 상점에 존재하지 않습니다.")
+
+
+@bot.command(name="구매")
+async def buy_item(ctx, item_name: str):
+  """상점에서 상품을 구매합니다."""
+  shop = data.get("shop", {})
+  if item_name not in shop:
+    await ctx.send(
+        "❌ 해당 상품이 상점에 없습니다. `!상점` 명령어로 확인해 주세요."
+    )
+    return
+
+  price = shop[item_name]
+  user_pts = get_user_points(ctx.author.id)
+
+  if user_pts < price:
+    await ctx.send(
+        f"❌ 포인트가 부족합니다! (필요 포인트: **{price:,}P** / 보유 포인트:"
+        f" **{user_pts:,}P**)"
+    )
+    return
+
+  update_user_points(ctx.author.id, -price)
+  user_str = str(ctx.author.id)
+  data["users"][user_str]["inventory"].append(item_name)
+  save_data(data)
+
+  await ctx.send(
+      f"🎉 {ctx.author.mention}님이 **[{item_name}]**을(를) 성공적으로"
+      f" 구매하셨습니다! (차감: **{price:,}P**)"
+  )
+
+
+@bot.command(name="인벤토리", aliases=["가방"])
+async def show_inventory(ctx):
+  """내가 구매한 아이템 목록을 확인합니다."""
+  user_str = str(ctx.author.id)
+  get_user_points(ctx.author.id)
+  inv = data["users"][user_str].get("inventory", [])
+
+  if not inv:
+    await ctx.send("🎒 인벤토리가 비어 있습니다.")
+    return
+
+  items_str = "\n".join([f"- {item}" for item in inv])
+  embed = discord.Embed(
+      title=f"🎒 {ctx.author.display_name}님의 인벤토리",
+      description=items_str,
+      color=discord.Color.blue(),
+  )
+  await ctx.send(embed=embed)
+
+
+@bot.command(name="도박", aliases=["주사위"])
+async def gamble(ctx, amount: int = None, multiplier: float = 2.0):
+  """포인트를 걸고 극악 확률의 배율 도박을 진행합니다. (예: !도박 1000 3)"""
+  if amount is None or amount <= 0:
+    await ctx.send(
+        "❌ 올바른 배팅 금액을 입력해주세요! 예: `!도박 1000 2`"
+    )
+    return
+
+  if multiplier < 1.1 or multiplier > 1000:
+    await ctx.send("❌ 배율은 **1.1배 ~ 1000배** 사이로 지정해주세요.")
+    return
+
+  user_id = ctx.author.id
+  current_pts = get_user_points(user_id)
+
+  if current_pts < amount:
+    await ctx.send(
+        f"❌ 보유한 포인트보다 많은 금액을 걸 수 없습니다. (현재 잔액:"
+        f" **{current_pts:,}P**)"
+    )
+    return
+
+  # 극악 배율 승리 확률 공식: 80 / (배율 ^ 1.6)
+  win_rate = round(min(80.0, 80.0 / (multiplier**1.6)), 2)
+  roll = round(random.uniform(0.01, 100.00), 2)
+
+  if roll <= win_rate:
+    profit = int(amount * multiplier) - amount
+    new_bal = update_user_points(user_id, profit)
+    await ctx.send(
+        f"🎲 **[도박 성공!]** 🎉\n🎯 주사위: **{roll}** (당첨 확률: **{win_rate}%**"
+        f" 이하)\n🚀 **{multiplier}배율** 성공! `+{profit:,}P` 획득! (현재 잔액:"
+        f" **{new_bal:,}P**)"
+    )
+  else:
+    new_bal = update_user_points(user_id, -amount)
+    await ctx.send(
+        f"🎲 **[도박 실패...]** 💀\n🎯 주사위: **{roll}** (당첨 확률: **{win_rate}%**"
+        f" 이하)\n💸 **{amount:,}P**를 잃었습니다. (현재 잔액: **{new_bal:,}P**)"
+    )
+
+
+@bot.command(name="올인")
+async def gamble_allin(ctx, multiplier: float = 2.0):
+  """보유한 모든 포인트를 걸고 배율 도박을 합니다. (예: !올인 5)"""
+  user_id = ctx.author.id
+  pts = get_user_points(user_id)
+
+  if pts <= 0:
+    await ctx.send("❌ 올인할 포인트가 없습니다!")
+    return
+
+  if multiplier < 1.1 or multiplier > 1000:
+    await ctx.send("❌ 배율은 **1.1배 ~ 1000배** 사이로 설정해주세요.")
+    return
+
+  win_rate = round(min(80.0, 80.0 / (multiplier**1.6)), 2)
+  roll = round(random.uniform(0.01, 100.00), 2)
+
+  if roll <= win_rate:
+    profit = int(pts * multiplier) - pts
+    new_bal = update_user_points(user_id, profit)
+    await ctx.send(
+        f"🔥 **[ALL-IN 대성공!!]** 🚀\n🎯 주사위: **{roll}** (당첨 확률:"
+        f" **{win_rate}%** 이하)\n👑 **{multiplier}배율** 당첨! 현재 잔액:"
+        f" **{new_bal:,}P**"
+    )
+  else:
+    update_user_points(user_id, -pts)
+    await ctx.send(
+        f"🔥 **[ALL-IN 파산]** 💸\n🎯 주사위: **{roll}** (당첨 확률: **{win_rate}%**"
+        " 이하)\n💀 모든 포인트를 잃고 완전히 파산하셨습니다. (현재 잔액: **0P**)"
+    )
+
+
+@bot.command(name="주식시장", aliases=["주식", "증권사"])
+async def show_stock_market(ctx):
+  """실시간 주식 시장 가격을 확인합니다."""
+  embed = discord.Embed(
+      title="📈 실시간 포인트 주식 시장",
+      description="30초마다 가격이 변동됩니다! (`!주식매수`, `!주식매도`)",
+      color=discord.Color.green(),
+  )
+  for name, info in stock_data.items():
+    embed.add_field(
+        name=f"🏢 {name}", value=f"현재 가격: **{info['price']:,}P**", inline=False
+    )
+  await ctx.send(embed=embed)
+
+
+@bot.command(name="주식매수", aliases=["매수", "주식구매"])
+async def buy_stock(ctx, stock_name: str, count: int = 1):
+  """주식을 매수합니다."""
+  if stock_name not in stock_data:
+    await ctx.send(
+        "❌ 존재하지 않는 주식입니다. `!주식시장`에서 종목을 확인해주세요."
+    )
+    return
+  if count <= 0:
+    await ctx.send("❌ 1주 이상부터 매수 가능합니다.")
+    return
+
+  price = stock_data[stock_name]["price"]
+  total_cost = price * count
+  user_id = ctx.author.id
+
+  if get_user_points(user_id) < total_cost:
+    await ctx.send(
+        f"❌ 포인트가 부족합니다! (필요: {total_cost:,}P / 보유:"
+        f" {get_user_points(user_id):,}P)"
+    )
+    return
+
+  update_user_points(user_id, -total_cost)
+  user_str = str(user_id)
+  if "user_stocks" not in data:
+    data["user_stocks"] = {}
+  if user_str not in data["user_stocks"]:
+    data["user_stocks"][user_str] = {}
+
+  data["user_stocks"][user_str][stock_name] = (
+      data["user_stocks"][user_str].get(stock_name, 0) + count
+  )
+  save_data(data)
+
+  await ctx.send(
+      f"📈 **{stock_name}** {count}주 매수 완료! (총 비용: **{total_cost:,}P**)"
+  )
+
+
+@bot.command(name="주식매도", aliases=["매도", "주식판매"])
+async def sell_stock(ctx, stock_name: str, count: int = 1):
+  """보유한 주식을 매도합니다."""
+  if stock_name not in stock_data:
+    await ctx.send("❌ 존재하지 않는 주식입니다.")
+    return
+
+  user_id = ctx.author.id
+  user_str = str(user_id)
+  my_stocks = data.get("user_stocks", {}).get(user_str, {})
+  owned = my_stocks.get(stock_name, 0)
+
+  if owned < count:
+    await ctx.send(
+        f"❌ 보유 중인 주식이 부족합니다! (보유: {owned}주 / 매도 요청:"
+        f" {count}주)"
+    )
+    return
+
+  price = stock_data[stock_name]["price"]
+  total_earn = price * count
+
+  data["user_stocks"][user_str][stock_name] -= count
+  update_user_points(user_id, total_earn)
+  save_data(data)
+
+  await ctx.send(
+      f"📉 **{stock_name}** {count}주 매도 완료! (획득 금액: **{total_earn:,}P**)"
+  )
+
+
+@bot.command(name="내주식", aliases=["주식잔고"])
+async def my_stock_portfolio(ctx):
+  """보유 중인 주식 포트폴리오를 조회합니다."""
+  user_str = str(ctx.author.id)
+  my_stocks = data.get("user_stocks", {}).get(user_str, {})
+
+  if not my_stocks or all(v == 0 for v in my_stocks.values()):
+    await ctx.send("📊 보유 중인 주식이 없습니다.")
+    return
+
+  embed = discord.Embed(
+      title=f"📊 {ctx.author.display_name}님의 주식 포트폴리오",
+      color=discord.Color.blue(),
+  )
+  total_eval = 0
+  for name, count in my_stocks.items():
+    if count > 0:
+      price = stock_data[name]["price"]
+      eval_val = price * count
+      total_eval += eval_val
+      embed.add_field(
+          name=f"🏢 {name}",
+          value=(
+              f"보유 수량: **{count}주**\n현재 평가금액: **{eval_val:,}P** (1주당"
+              f" {price:,}P)"
+          ),
+          inline=False,
+      )
+  embed.set_footer(text=f"총 주식 평가액: {total_eval:,}P")
+  await ctx.send(embed=embed)
 
 
 # =========================================================
 # --- [ 5v5 내전 명령어 ] ---
 # =========================================================
-
-
 @bot.command(name="참가")
 async def join_5v5(ctx):
   user = ctx.author
@@ -278,8 +699,6 @@ async def reset_5v5(ctx):
 # =========================================================
 # --- [ 1v1 내전 전용 명령어 ] ---
 # =========================================================
-
-
 @bot.command(name="1v1참가")
 async def join_1v1(ctx):
   user = ctx.author
@@ -472,8 +891,6 @@ async def reset_all_stats_1v1(ctx):
 # =========================================================
 # --- [ ⚽ 피파온라인 조별리그(승점) & 토너먼트(3판2승) ] ---
 # =========================================================
-
-
 @bot.command(name="피파추가")
 @commands.has_permissions(administrator=True)
 async def add_fifa_user(ctx, *, user_input: str = None):
@@ -529,9 +946,8 @@ async def list_fifa(ctx):
 async def make_fifa_groups(
     ctx, group_count: int = 2, per_group_count: int = None
 ):
-  """조수와 조원수를 직접 정할 수 있는 조 배정 기능 (예: !피파조배정 2 3)"""
   global fifa_groups, current_tournament_round
-  current_tournament_round = 0  # 0은 조별리그 상태
+  current_tournament_round = 0
 
   if not queue_fifa:
     await ctx.send("❌ 피파 참가자 명단이 비어있습니다.")
@@ -577,7 +993,6 @@ async def make_fifa_groups(
 
 @bot.command(name="피파조대진표")
 async def show_group_matches(ctx, *, target_group: str = None):
-  """특정 조 대진표 조회 (예: !피파조대진표 A조)"""
   if not fifa_groups:
     await ctx.send("❌ 먼저 `!피파조배정`으로 조 배정을 진행해주세요.")
     return
@@ -616,10 +1031,8 @@ async def show_group_matches(ctx, *, target_group: str = None):
   await ctx.send(embed=embed)
 
 
-# ✨ [신규] 전체 조별 풀리그 대진표 일괄 조회 명령어
 @bot.command(name="피파조대진표확인")
 async def show_all_group_matches(ctx):
-  """현재 작성된 모든 조의 풀리그 경기 대진표를 다시 보여줍니다."""
   if not fifa_groups:
     await ctx.send("❌ 아직 배정된 조가 없습니다. `!피파조배정`을 먼저 실행해주세요!")
     return
@@ -694,13 +1107,11 @@ async def show_fifa_group_rankings(ctx):
 async def add_fifa_match_result(
     ctx, p1_name: str, p1_score: int, p2_name: str, p2_score: int
 ):
-  """조별리그(승점) 및 토너먼트(3판2승) 자동 분기 처리"""
   global fifa_winners, tournament_match_wins
 
   p1_stat = get_or_init_fifa_stat(p1_name)
   p2_stat = get_or_init_fifa_stat(p2_name)
 
-  # 통계 및 득실 계산
   p1_stat["gf"] += p1_score
   p1_stat["ga"] += p2_score
   p1_stat["gd"] = p1_stat["gf"] - p1_stat["ga"]
@@ -709,7 +1120,6 @@ async def add_fifa_match_result(
   p2_stat["ga"] += p1_score
   p2_stat["gd"] = p2_stat["gf"] - p2_stat["ga"]
 
-  # 승패 판단
   set_winner = None
   if p1_score > p2_score:
     p1_stat["win"] += 1
@@ -727,7 +1137,6 @@ async def add_fifa_match_result(
     p2_stat["draw"] += 1
     p2_stat["pts"] += 1
 
-  # --- [1. 조별 리그 진행 중일 때] ---
   if current_tournament_round == 0:
     res_msg = f"🏆 **{set_winner}** 승리! (승점 +3)" if set_winner else "🤝 **무승부!**"
     embed = discord.Embed(
@@ -750,7 +1159,6 @@ async def add_fifa_match_result(
     await ctx.send(embed=embed)
     return
 
-  # --- [2. 토너먼트 진행 중일 때 (3판 2선승제 적용)] ---
   if not set_winner:
     await ctx.send(
         "⚠️ 토너먼트에서는 승부차기 등을 통해 승패가 가려져야 합니다!"
@@ -810,7 +1218,6 @@ async def list_fifa_winners(ctx):
 @bot.command(name="피파토너먼트")
 @commands.has_permissions(administrator=True)
 async def make_fifa_tournament(ctx, rounds: int = 16):
-  """본선 토너먼트 생성 (16, 8, 4, 2) - 3판 2선승제 적용"""
   global last_fifa_group_embed, current_tournament_round, fifa_winners, tournament_match_wins
 
   if rounds not in [2, 4, 8, 16, 32]:
@@ -955,8 +1362,6 @@ async def reset_fifa(ctx):
 # =========================================================
 # --- [ 공통 관리자, 청소 및 차단 기능 ] ---
 # =========================================================
-
-
 @bot.command(name="청소", aliases=["삭제"])
 @commands.has_permissions(administrator=True)
 async def clear_messages(ctx, count: int = 10):
@@ -1057,5 +1462,9 @@ async def on_command_error(ctx, error):
     await ctx.send("❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다.")
 
 
+# --- 봇 실행 ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(TOKEN)
+if TOKEN:
+  bot.run(TOKEN)
+else:
+  print("DISCORD_TOKEN 환경 변수가 설정되지 않았습니다.")
