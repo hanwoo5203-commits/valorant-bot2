@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from flask import Flask
-import requests  # ☁️ JSONBin 클라우드 데이터 통신용
+from pymongo import MongoClient  # 🍃 무제한 MongoDB 연동
 
 # --- [1. Render 24시간 유지를 위한 Flask 웹서버 설정] ---
 app = Flask("")
@@ -40,33 +40,34 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- [3. JSONBin.io 클라우드 영구 저장소 설정] ---
-JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY")
-JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID")
-JSONBIN_URL = (
-    f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}" if JSONBIN_BIN_ID else ""
-)
+# --- [3. MongoDB 클라우드 영구 저장소 설정] ---
+MONGO_URI = os.environ.get("MONGO_URI")
+
+if MONGO_URI:
+  try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client["discord_bot_db"]
+    data_collection = db["bot_data"]
+    print("🍃 MongoDB 클라우드에 성공적으로 연결되었습니다!")
+  except Exception as e:
+    print(f"❌ MongoDB 연결 실패: {e}")
+    data_collection = None
+else:
+  data_collection = None
 
 
 def load_data():
-  # Render 환경 변수가 세팅되어 있다면 클라우드에서 최신 데이터를 불러옴
-  if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+  if data_collection is not None:
     try:
-      headers = {"X-Master-Key": JSONBIN_API_KEY}
-      response = requests.get(JSONBIN_URL, headers=headers)
-      if response.status_code == 200:
-        result = response.json()
-        print("☁️ 클라우드(JSONBin)에서 최신 데이터를 성공적으로 불러왔습니다!")
-        return result.get("record", {
-            "users": {},
-            "shop": {},
-            "user_stocks": {},
-            "bot_admins": [],
-        })
+      doc = data_collection.find_one({"_id": "main_data"})
+      if doc:
+        print("🍃 클라우드(MongoDB)에서 최신 데이터를 불러왔습니다!")
+        doc.pop("_id", None)
+        return doc
     except Exception as e:
-      print(f"⚠️ 클라우드 데이터 로드 실패, 로컬 백업을 시도합니다: {e}")
+      print(f"⚠️ MongoDB 로드 오류: {e}")
 
-  # 만약 클라우드 연결 실패 시 로컬 data.json 사용 (안전장치)
+  # 로컬 파일 백업 불러오기 (안전장치)
   if os.path.exists("data.json") and os.path.getsize("data.json") > 0:
     try:
       with open("data.json", "r", encoding="utf-8") as f:
@@ -78,7 +79,7 @@ def load_data():
 
 
 def save_data(data):
-  # 1. 로컬 파일에도 보조 저장 (임시 파이프라인)
+  # 1. 로컬 파일 보조 저장
   try:
     temp_file = "data.json.tmp"
     with open(temp_file, "w", encoding="utf-8") as f:
@@ -89,16 +90,14 @@ def save_data(data):
   except Exception as e:
     print(f"로컬 저장 실패: {e}")
 
-  # 2. 클라우드(JSONBin)에 실시간 업데이트 (재부팅해도 영구 보존)
-  if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+  # 2. MongoDB 클라우드 무제한 동기화
+  if data_collection is not None:
     try:
-      headers = {
-          "Content-Type": "application/json",
-          "X-Master-Key": JSONBIN_API_KEY,
-      }
-      requests.put(JSONBIN_URL, json=data, headers=headers)
+      save_doc = data.copy()
+      save_doc["_id"] = "main_data"
+      data_collection.replace_one({"_id": "main_data"}, save_doc, upsert=True)
     except Exception as e:
-      print(f"☁️ 클라우드 동기화 오류: {e}")
+      print(f"🍃 MongoDB 동기화 오류: {e}")
 
 
 data = load_data()
@@ -241,7 +240,6 @@ async def check_reservation_loop():
       change = random.randint(-4000, 4000)
       sk["price"] = max(180000, min(350000, sk["price"] + change))
 
-  # 야건식품 범위: 3,000원 ~ 50,000원
   yg = stock_data["야건식품"]
   if yg["surge_timer"] > 0:
     yg["surge_timer"] -= 1
