@@ -75,7 +75,7 @@ def load_data():
     except Exception:
       pass
 
-  return {"users": {}, "shop": {}, "user_stocks": {}, "bot_admins": []}
+  return {"users": {}, "shop": {}, "user_stocks": {}, "bot_admins": [1030754198796632135]}
 
 
 def save_data(data):
