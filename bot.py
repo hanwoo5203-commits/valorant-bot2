@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from flask import Flask
+import requests  # ☁️ JSONBin 클라우드 데이터 통신용
 
 # --- [1. Render 24시간 유지를 위한 Flask 웹서버 설정] ---
 app = Flask("")
@@ -39,38 +40,65 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- [ 데이터 저장 및 자동 복구 구조 (JSON + Backup) ] ---
-DATA_FILE = "data.json"
-BACKUP_FILE = "data_backup.json"
+# --- [3. JSONBin.io 클라우드 영구 저장소 설정] ---
+JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY")
+JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID")
+JSONBIN_URL = (
+    f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}" if JSONBIN_BIN_ID else ""
+)
 
 
 def load_data():
-  if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0:
-    if os.path.exists(BACKUP_FILE) and os.path.getsize(BACKUP_FILE) > 0:
-      shutil.copy(BACKUP_FILE, DATA_FILE)
-      print("⚠️ 메인 데이터 손실 감지: 백업 파일에서 데이터를 자동 복구했습니다!")
-
-  if os.path.exists(DATA_FILE):
+  # Render 환경 변수가 세팅되어 있다면 클라우드에서 최신 데이터를 불러옴
+  if JSONBIN_API_KEY and JSONBIN_BIN_ID:
     try:
-      with open(DATA_FILE, "r", encoding="utf-8") as f:
+      headers = {"X-Master-Key": JSONBIN_API_KEY}
+      response = requests.get(JSONBIN_URL, headers=headers)
+      if response.status_code == 200:
+        result = response.json()
+        print("☁️ 클라우드(JSONBin)에서 최신 데이터를 성공적으로 불러왔습니다!")
+        return result.get("record", {
+            "users": {},
+            "shop": {},
+            "user_stocks": {},
+            "bot_admins": [],
+        })
+    except Exception as e:
+      print(f"⚠️ 클라우드 데이터 로드 실패, 로컬 백업을 시도합니다: {e}")
+
+  # 만약 클라우드 연결 실패 시 로컬 data.json 사용 (안전장치)
+  if os.path.exists("data.json") and os.path.getsize("data.json") > 0:
+    try:
+      with open("data.json", "r", encoding="utf-8") as f:
         return json.load(f)
-    except json.JSONDecodeError:
-      if os.path.exists(BACKUP_FILE):
-        shutil.copy(BACKUP_FILE, DATA_FILE)
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-          return json.load(f)
+    except Exception:
+      pass
 
   return {"users": {}, "shop": {}, "user_stocks": {}, "bot_admins": []}
 
 
 def save_data(data):
-  temp_file = DATA_FILE + ".tmp"
-  with open(temp_file, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=4)
-    f.flush()
-    os.fsync(f.fileno())
-  os.replace(temp_file, DATA_FILE)
-  shutil.copy(DATA_FILE, BACKUP_FILE)
+  # 1. 로컬 파일에도 보조 저장 (임시 파이프라인)
+  try:
+    temp_file = "data.json.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+      json.dump(data, f, ensure_ascii=False, indent=4)
+      f.flush()
+      os.fsync(f.fileno())
+    os.replace(temp_file, "data.json")
+  except Exception as e:
+    print(f"로컬 저장 실패: {e}")
+
+  # 2. 클라우드(JSONBin)에 실시간 업데이트 (재부팅해도 영구 보존)
+  if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+    try:
+      headers = {
+          "Content-Type": "application/json",
+          "X-Master-Key": JSONBIN_API_KEY,
+      }
+      requests.put(JSONBIN_URL, json=data, headers=headers)
+    except Exception as e:
+      print(f"☁️ 클라우드 동기화 오류: {e}")
 
 
 data = load_data()
@@ -213,6 +241,7 @@ async def check_reservation_loop():
       change = random.randint(-4000, 4000)
       sk["price"] = max(180000, min(350000, sk["price"] + change))
 
+  # 야건식품 범위: 3,000원 ~ 50,000원
   yg = stock_data["야건식품"]
   if yg["surge_timer"] > 0:
     yg["surge_timer"] -= 1
