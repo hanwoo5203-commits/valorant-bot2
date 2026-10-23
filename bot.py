@@ -1,5 +1,7 @@
 import asyncio
-import datetime
+import datetime as dt_mod
+from datetime import datetime
+import io
 import itertools
 import json
 import os
@@ -10,7 +12,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from flask import Flask
-from pymongo import MongoClient  # 🍃 무제한 MongoDB 연동
+import matplotlib.pyplot as plt
+from pymongo import MongoClient
+import pytz
 
 # --- [1. Render 24시간 유지를 위한 Flask 웹서버 설정] ---
 app = Flask("")
@@ -75,7 +79,12 @@ def load_data():
     except Exception:
       pass
 
-  return {"users": {}, "shop": {}, "user_stocks": {}, "bot_admins": [1030754198796632135]}
+  return {
+      "users": {},
+      "shop": {},
+      "user_stocks": {},
+      "bot_admins": [1030754198796632135],
+  }
 
 
 def save_data(data):
@@ -134,11 +143,15 @@ def update_user_points(user_id, amount):
   return data["users"][user_str]["points"]
 
 
+# -------------------------------------------------------------
+# 👑 [최고 권한 체크] 오직 '나(개발자)' 단 한 사람만 승인하는 함수
+# -------------------------------------------------------------
+MY_DISCORD_ID = 1030754198796632135  # 본인의 디스코드 사용자 ID
+
+
 def is_bot_admin_check(interaction: discord.Interaction) -> bool:
-  return (
-      interaction.user.id in data.get("bot_admins", [])
-      or interaction.user.id == interaction.guild.owner_id
-  )
+  # 서버 소유자나 일반 관리자 목록을 무시하고, 오직 본인 ID일 때만 True 반환!
+  return interaction.user.id == MY_DISCORD_ID
 
 
 # --- 전역 상태 데이터 ---
@@ -163,10 +176,29 @@ user_wins_1v1 = {}
 banned_users = {}
 
 stock_data = {
-    "SK다우닉스": {"price": 300000, "surge_timer": 0},
-    "야건식품": {"price": 3000, "surge_timer": 0},
-    "야멧돼농협": {"price": 50000, "surge_timer": 0},
+    "SK다우닉스": {
+        "price": 300000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [300000],
+    },
+    "야건식품": {
+        "price": 3000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [3000],
+    },
+    "야멧돼농협": {
+        "price": 50000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [50000],
+    },
 }
+
+# 주식 시장 강제 차단 여부 및 1~2시간 랜덤 이벤트 타이머
+stock_market_force_closed = False
+next_stock_update_time = time.time() + random.randint(3600, 7200)
 
 
 def get_tier_info(wins: int):
@@ -207,12 +239,11 @@ def get_or_init_fifa_stat(name: str):
 # ==========================================
 @tasks.loop(seconds=30)
 async def check_reservation_loop():
-  global is_open_5v5, reserved_time_5v5, reserved_channel_5v5, stock_data
+  global is_open_5v5, reserved_time_5v5, reserved_channel_5v5
+  global next_stock_update_time, stock_data, stock_market_force_closed
 
   if reserved_time_5v5 is not None:
-    now_kst = datetime.datetime.now(
-        datetime.timezone(datetime.timedelta(hours=9))
-    )
+    now_kst = datetime.now(dt_mod.timezone(dt_mod.timedelta(hours=9)))
     current_time_str = now_kst.strftime("%H:%M")
 
     if current_time_str == reserved_time_5v5:
@@ -227,35 +258,150 @@ async def check_reservation_loop():
             " 명령어를 입력하세요!"
         )
 
-  sk = stock_data["SK다우닉스"]
-  if sk["surge_timer"] > 0:
-    sk["surge_timer"] -= 1
-    if sk["surge_timer"] == 0:
-      sk["price"] = random.randint(280000, 320000)
-  else:
-    if random.randint(1, 40) == 1:
-      sk["price"] = random.randint(200000, 220000)
-      sk["surge_timer"] = 3
-    else:
-      change = random.randint(-4000, 4000)
-      sk["price"] = max(180000, min(350000, sk["price"] + change))
+  # 주식 시장이 강제 차단되어 있으면 아래 주가 변동 및 이벤트 루프를 건너뜁니다.
+  if stock_market_force_closed:
+    return
 
-  yg = stock_data["야건식품"]
-  if yg["surge_timer"] > 0:
-    yg["surge_timer"] -= 1
-    if yg["surge_timer"] == 0:
-      yg["price"] = random.randint(3000, 15000)
-  else:
-    if random.randint(1, 60) == 1:
-      yg["price"] = random.randint(20000, 50000)
-      yg["surge_timer"] = 2
-    else:
-      change = random.randint(-1500, 2500)
-      yg["price"] = max(3000, min(50000, yg["price"] + change))
+  # 평소 미세 횡보 제어 (0시~7시는 완전 고정, 그 외는 -0.5%~+0.5% 횡보)
+  kst = pytz.timezone("Asia/Seoul")
+  now_kst = datetime.now(kst)
+  current_hour = now_kst.hour
 
-  ym = stock_data["야멧돼농협"]
-  change = random.randint(-15000, 15000)
-  ym["price"] = max(10000, min(140000, ym["price"] + change))
+  if not (0 <= current_hour < 7):
+    for stock_name, stock_info in stock_data.items():
+      if stock_info.get("status") == "bankrupt":
+        continue
+      flat_change = random.uniform(-0.005, 0.005)
+      old_price = stock_info["price"]
+      new_price = max(100, int(old_price * (1 + flat_change)))
+      stock_info["price"] = new_price
+
+  # 1~2시간 랜덤 주기로 터지는 대폭등 & 부도 이벤트 체크
+  if time.time() >= next_stock_update_time:
+    await trigger_random_stock_event()
+    next_stock_update_time = time.time() + random.randint(3600, 7200)
+
+
+async def trigger_random_stock_event():
+  global stock_data, stock_market_force_closed
+  if stock_market_force_closed:
+    return
+
+  news_channel_id = os.environ.get("NEWS_CHANNEL_ID")
+  news_channel = None
+  if news_channel_id:
+    news_channel = bot.get_channel(int(news_channel_id))
+  else:
+    for guild in bot.guilds:
+      for channel in guild.text_channels:
+        if channel.permissions_for(guild.me).send_messages:
+          news_channel = channel
+          break
+      if news_channel:
+        break
+
+  kst = pytz.timezone("Asia/Seoul")
+  current_hour = datetime.now(kst).hour
+
+  if 0 <= current_hour < 7:
+    return
+
+  is_night_fluctuation = current_hour >= 21 or current_hour < 8
+
+  for stock_name, stock_info in stock_data.items():
+    if stock_info.get("status") == "bankrupt":
+      if time.time() < stock_info.get("resume_time", 0):
+        continue
+      else:
+        stock_info["status"] = "normal"
+
+    if is_night_fluctuation:
+      fluctuation = random.uniform(-0.02, 0.03)
+      old_price = stock_info["price"]
+      new_price = max(100, int(old_price * (1 + fluctuation)))
+      stock_info["price"] = new_price
+
+      if "history" not in stock_info:
+        stock_info["history"] = []
+      stock_info["history"].append(new_price)
+      if len(stock_info["history"]) > 24:
+        stock_info["history"].pop(0)
+
+      if news_channel:
+        embed = discord.Embed(
+            title=f"🌙 [야간 장] {stock_name} 소폭 변동",
+            description=(
+                "야간 시간대에는 부도 및 급등이 정지됩니다.\n\n💵 현재가:"
+                f" **{new_price:,}원**"
+            ),
+            color=0x7289DA,
+        )
+        await news_channel.send(embed=embed)
+    else:
+      if stock_name == "SK다우닉스":
+        bankruptcy_chance = 5
+      elif stock_name == "야멧돼농협":
+        bankruptcy_chance = 10
+      elif stock_name == "야건식품":
+        bankruptcy_chance = 15
+      else:
+        bankruptcy_chance = 10
+
+      is_bankrupt = random.randint(1, 100) <= bankruptcy_chance
+
+      if is_bankrupt:
+        for user_str, user_stocks_dict in data.get("user_stocks", {}).items():
+          if stock_name in user_stocks_dict:
+            user_stocks_dict[stock_name] = 0
+
+        stock_info["status"] = "bankrupt"
+        stock_info["resume_time"] = time.time() + 180
+        stock_info["price"] = 1000
+
+        if "history" not in stock_info:
+          stock_info["history"] = []
+        stock_info["history"].append(1000)
+        if len(stock_info["history"]) > 24:
+          stock_info["history"].pop(0)
+
+        if news_channel:
+          embed = discord.Embed(
+              title=f"🚨 [속보] {stock_name} 기업 파산 선고!",
+              description=(
+                  f"재무 악화로 인해 **{stock_name}**이(가) 결국 **부도**"
+                  " 처리되었습니다!\n\n💥 **주주들의 보유 주식과 투자금은 전액"
+                  " 손실되었습니다.**\n⏱️ **3분간 거래가 정지**되며, 이후"
+                  " 초기가(1,000원)로 재상장됩니다."
+              ),
+              color=0xFF0000,
+          )
+          await news_channel.send(embed=embed)
+      else:
+        increase_rate = random.uniform(0.10, 0.60)
+        old_price = stock_info["price"]
+        new_price = int(old_price * (1 + increase_rate))
+        stock_info["price"] = new_price
+
+        if "history" not in stock_info:
+          stock_info["history"] = []
+        stock_info["history"].append(new_price)
+        if len(stock_info["history"]) > 24:
+          stock_info["history"].pop(0)
+
+        if news_channel:
+          embed = discord.Embed(
+              title=f"📈 [호재] {stock_name} 주가 대폭등!",
+              description=(
+                  f"대형 호재가 터지며 **{stock_name}** 주가가"
+                  f" **+{int(increase_rate * 100)}%** 급등했습니다!\n\n💵"
+                  f" 현재가: **{new_price:,}원** (이전가: {old_price:,}원)\n🛡️"
+                  f" *현재 부도 위험 확률: {bankruptcy_chance}%*"
+              ),
+              color=0x00FF00,
+          )
+          await news_channel.send(embed=embed)
+
+  save_data(data)
 
 
 @check_reservation_loop.before_loop
@@ -344,9 +490,9 @@ async def list_bot_admins(interaction: discord.Interaction):
 async def daily_checkin(interaction: discord.Interaction):
   user_id = interaction.user.id
   user_info = get_user_data(user_id)
-  today_str = (
-      datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-  ).strftime("%Y-%m-%d")
+  today_str = (datetime.utcnow() + dt_mod.timedelta(hours=9)).strftime(
+      "%Y-%m-%d"
+  )
 
   if user_info.get("last_checkin") == today_str:
     await interaction.response.send_message(
@@ -596,15 +742,29 @@ async def show_inventory(interaction: discord.Interaction):
   await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="도박", description="배율을 설정하고 도박을 진행합니다.")
+@bot.tree.command(name="도박", description="배율을 설정하고 도박을 진행합니다 (2~9배율).")
 async def gamble(
-    interaction: discord.Interaction, amount: int, multiplier: float = 2.0
+    interaction: discord.Interaction, amount: int, multiplier: int = 2
 ):
   if amount <= 0:
     await interaction.response.send_message("❌ 올바른 배팅 금액을 입력해주세요!")
     return
-  if multiplier < 1.1 or multiplier > 1000:
-    await interaction.response.send_message("❌ 배율은 **1.1배 ~ 1000배** 사이로 지정해주세요.")
+
+  win_rates = {
+      2: 44.0,
+      3: 30.0,
+      4: 19.0,
+      5: 5.0,
+      6: 2.0,
+      7: 1.0,
+      8: 0.6,
+      9: 0.01,
+  }
+
+  if multiplier not in win_rates:
+    await interaction.response.send_message(
+        "❌ 지원하는 배율은 **2, 3, 4, 5, 6, 7, 8, 9**배율만 가능합니다!"
+    )
     return
 
   user_id = interaction.user.id
@@ -614,7 +774,7 @@ async def gamble(
     await interaction.response.send_message("❌ 보유 포인트가 부족합니다!")
     return
 
-  win_rate = round(min(80.0, 80.0 / (multiplier**1.6)), 2)
+  win_rate = win_rates[multiplier]
   roll = round(random.uniform(0.01, 100.00), 2)
 
   if roll <= win_rate:
@@ -636,20 +796,74 @@ async def gamble(
 async def show_stock_market(interaction: discord.Interaction):
   embed = discord.Embed(
       title="📈 실시간 포인트 주식 시장",
-      description="30초마다 가격이 변동됩니다!",
+      description=(
+          "1~2시간마다 랜덤 대폭등 및 부도(SK다우닉스 5%, 야멧돼농협 10%,"
+          " 야건식품 15%)가 판가름 납니다!"
+      ),
       color=discord.Color.green(),
   )
   for name, info in stock_data.items():
+    status_msg = (
+        "🟢 정상 거래중"
+        if info.get("status") != "bankrupt"
+        else "🚨 부도 (거래 정지)"
+    )
     embed.add_field(
-        name=f"🏢 {name}", value=f"현재 가격: **{info['price']:,}P**", inline=False
+        name=f"🏢 {name}",
+        value=(
+            f"현재 가격: **{info['price']:,}P**\n상태: `{status_msg}`"
+        ),
+        inline=False,
     )
   await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="주가", description="지정한 주식의 최근 가격 변동 그래프를 조회합니다.")
+async def show_stock_graph(interaction: discord.Interaction, stock_name: str):
+  if stock_name not in stock_data:
+    await interaction.response.send_message(
+        "❌ 존재하지 않는 주식 종목입니다."
+    )
+    return
+
+  stock_info = stock_data[stock_name]
+  history = stock_info.get("history", [stock_info["price"]])
+
+  plt.figure(figsize=(8, 4))
+  plt.plot(history, marker="o", color="#5865F2", linewidth=2)
+  plt.title(f"{stock_name} Price Trend (Recent Hours)", fontsize=14)
+  plt.xlabel("Hours Ago", fontsize=10)
+  plt.ylabel("Price (KRW/P)", fontsize=10)
+  plt.grid(True, linestyle="--", alpha=0.6)
+
+  buf = io.BytesIO()
+  plt.savefig(buf, format="png", bbox_inches="tight")
+  buf.seek(0)
+  plt.close()
+
+  file = discord.File(buf, filename="stock_graph.png")
+  embed = discord.Embed(
+      title=f"📊 {stock_name} 주가 차트",
+      description=f"현재가: **{stock_info['price']:,}P**",
+      color=0x3498DB,
+  )
+  embed.set_image(url="attachment://stock_graph.png")
+
+  await interaction.response.send_message(file=file, embed=embed)
 
 
 @bot.tree.command(name="주식매수", description="주식을 지정 수량만큼 매수합니다.")
 async def buy_stock(
     interaction: discord.Interaction, stock_name: str, count: int = 1
 ):
+  global stock_market_force_closed
+  if stock_market_force_closed:
+    await interaction.response.send_message(
+        "❌ 현재 관리자에 의해 **주식 시장이 긴급 차단**되어 매수할 수 없습니다!",
+        ephemeral=True,
+    )
+    return
+
   if stock_name not in stock_data:
     await interaction.response.send_message("❌ 존재하지 않는 주식입니다.")
     return
@@ -657,7 +871,19 @@ async def buy_stock(
     await interaction.response.send_message("❌ 1주 이상부터 매수 가능합니다.")
     return
 
-  price = stock_data[stock_name]["price"]
+  stock_info = stock_data[stock_name]
+  if stock_info.get("status") == "bankrupt":
+    remaining = int(stock_info.get("resume_time", 0) - time.time())
+    if remaining > 0:
+      await interaction.response.send_message(
+          f"⚠️ **{stock_name}** 종목은 현재 부도로 인해 거래 정지 상태입니다!"
+          f" (재개까지 약 {remaining // 60}분 {remaining % 60}초 남음)"
+      )
+      return
+    else:
+      stock_info["status"] = "normal"
+
+  price = stock_info["price"]
   total_cost = price * count
   user_id = interaction.user.id
 
@@ -742,6 +968,65 @@ async def my_stock_portfolio(interaction: discord.Interaction):
       )
   embed.set_footer(text=f"총 주식 평가액: {total_eval:,}P")
   await interaction.response.send_message(embed=embed)
+
+
+# ==========================================
+# 📈 주식 시장 강제 제어 명령어 (개발자 전용)
+# ==========================================
+@bot.tree.command(name="주식열기", description="[개발자] 강제 차단되었던 주식 시장을 다시 엽니다.")
+async def force_open_stock_market(interaction: discord.Interaction):
+  if not is_bot_admin_check(interaction):
+    await interaction.response.send_message(
+        "❌ 이 명령어는 **개발자(본인)**만 사용할 수 있습니다!", ephemeral=True
+    )
+    return
+
+  global stock_market_force_closed
+  stock_market_force_closed = False
+  await interaction.response.send_message(
+      "🟢 **[주식 시장 강제 개방]** 관리자에 의해 주식 시장 거래와 이벤트가"
+      " 정상화되었습니다!"
+  )
+
+
+@bot.tree.command(
+    name="주식차단", description="[개발자] 주식 시장 거래와 이벤트를 강제로 긴급 차단합니다."
+)
+async def force_close_stock_market(interaction: discord.Interaction):
+  if not is_bot_admin_check(interaction):
+    await interaction.response.send_message(
+        "❌ 이 명령어는 **개발자(본인)**만 사용할 수 있습니다!", ephemeral=True
+    )
+    return
+
+  global stock_market_force_closed
+  stock_market_force_closed = True
+  await interaction.response.send_message(
+      "🚨 **[주식 시장 긴급 차단]** 관리자에 의해 주식 시장 거래와 이벤트가"
+      " 강제로 중단되었습니다!"
+  )
+
+
+@bot.tree.command(
+    name="주식상태", description="[개발자] 현재 주식 시장의 강제 차단 여부와 상태를 확인합니다."
+)
+async def check_stock_market_status(interaction: discord.Interaction):
+  if not is_bot_admin_check(interaction):
+    await interaction.response.send_message(
+        "❌ 이 명령어는 **개발자(본인)**만 사용할 수 있습니다!", ephemeral=True
+    )
+    return
+
+  global stock_market_force_closed
+  status_text = (
+      "🔴 **[강제 차단됨]** (거래 및 자동 이벤트 중지)"
+      if stock_market_force_closed
+      else "🟢 **[정상 운영 중]**"
+  )
+  embed = discord.Embed(
+      title="📊 주식 시장 운영 상태", description=status_text, color=discord.Color.blue()
+  )
+  await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ==========================================

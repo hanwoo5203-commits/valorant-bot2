@@ -2,3 +2,4 @@ discord.py
 Flask
 pymongo
 dnspython
+matplotlib
