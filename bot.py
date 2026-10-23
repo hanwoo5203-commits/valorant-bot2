@@ -151,7 +151,6 @@ MY_DISCORD_ID = 1030754198796632135  # 본인의 디스코드 사용자 ID
 
 
 def is_bot_admin_check(interaction: discord.Interaction) -> bool:
-  # 서버 소유자나 일반 관리자 목록을 무시하고, 오직 본인 ID일 때만 True 반환![cite: 9]
   return interaction.user.id == MY_DISCORD_ID
 
 
@@ -175,6 +174,13 @@ fifa_stats = {}
 
 user_wins_1v1 = {}
 banned_users = {}
+
+# 각 주식 종목별 기본(최저) 가격
+DEFAULT_STOCK_PRICES = {
+    "SK다우닉스": 300000,
+    "야건식품": 3000,
+    "야멧돼농협": 50000,
+}
 
 stock_data = {
     "SK다우닉스": {
@@ -259,11 +265,9 @@ async def check_reservation_loop():
             " 명령어를 입력하세요!"
         )
 
-  # 주식 시장이 강제 차단되어 있으면 아래 주가 변동 및 이벤트 루프를 건너뜁니다.
   if stock_market_force_closed:
     return
 
-  # 평소 미세 횡보 제어 (0시~7시는 완전 고정, 그 외는 -0.5%~+0.5% 횡보)
   kst = pytz.timezone("Asia/Seoul")
   now_kst = datetime.now(kst)
   current_hour = now_kst.hour
@@ -277,7 +281,6 @@ async def check_reservation_loop():
       new_price = max(100, int(old_price * (1 + flat_change)))
       stock_info["price"] = new_price
 
-  # 1~2시간 랜덤 주기로 터지는 대폭등 & 부도 이벤트 체크
   if time.time() >= next_stock_update_time:
     await trigger_random_stock_event()
     next_stock_update_time = time.time() + random.randint(3600, 7200)
@@ -355,13 +358,16 @@ async def trigger_random_stock_event():
           if stock_name in user_stocks_dict:
             user_stocks_dict[stock_name] = 0
 
+        # 부도시 해당 주식의 원래 기준 최저가로 설정
+        base_price = DEFAULT_STOCK_PRICES.get(stock_name, 1000)
+
         stock_info["status"] = "bankrupt"
         stock_info["resume_time"] = time.time() + 180
-        stock_info["price"] = 1000
+        stock_info["price"] = base_price
 
         if "history" not in stock_info:
           stock_info["history"] = []
-        stock_info["history"].append(1000)
+        stock_info["history"].append(base_price)
         if len(stock_info["history"]) > 24:
           stock_info["history"].pop(0)
 
@@ -372,7 +378,7 @@ async def trigger_random_stock_event():
                   f"재무 악화로 인해 **{stock_name}**이(가) 결국 **부도**"
                   " 처리되었습니다!\n\n💥 **주주들의 보유 주식과 투자금은 전액"
                   " 손실되었습니다.**\n⏱️ **3분간 거래가 정지**되며, 이후"
-                  " 초기가(1,000원)로 재상장됩니다."
+                  f" 기준 최저가({base_price:,}원)로 재상장됩니다."
               ),
               color=0xFF0000,
           )
@@ -866,7 +872,6 @@ async def buy_stock(
 ):
   global stock_market_force_closed
 
-  # 1. 관리자에 의해 주식 시장이 차단된 경우 매수 불가
   if stock_market_force_closed:
     await interaction.response.send_message(
         "❌ 현재 관리자에 의해 **주식 시장이 긴급 차단**되어 매수할 수 없습니다!",
@@ -874,7 +879,6 @@ async def buy_stock(
     )
     return
 
-  # 2. 새벽 시간대(00:00~07:00 KST) 시세가 고정되어 거래 불가
   kst = pytz.timezone("Asia/Seoul")
   current_hour = datetime.now(kst).hour
   if 0 <= current_hour < 7:
@@ -934,7 +938,6 @@ async def sell_stock(
 ):
   global stock_market_force_closed
 
-  # 1. 관리자에 의해 주식 시장이 차단된 경우 매도 불가
   if stock_market_force_closed:
     await interaction.response.send_message(
         "❌ 현재 관리자에 의해 **주식 시장이 긴급 차단**되어 매도할 수 없습니다!",
@@ -942,7 +945,6 @@ async def sell_stock(
     )
     return
 
-  # 2. 새벽 시간대(00:00~07:00 KST) 시세가 고정되어 거래 불가
   kst = pytz.timezone("Asia/Seoul")
   current_hour = datetime.now(kst).hour
   if 0 <= current_hour < 7:
