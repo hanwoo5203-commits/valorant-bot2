@@ -151,7 +151,7 @@ MY_DISCORD_ID = 1030754198796632135  # 본인의 디스코드 사용자 ID
 
 
 def is_bot_admin_check(interaction: discord.Interaction) -> bool:
-  # 서버 소유자나 일반 관리자 목록을 무시하고, 오직 본인 ID일 때만 True 반환!
+  # 서버 소유자나 일반 관리자 목록을 무시하고, 오직 본인 ID일 때만 True 반환![cite: 9]
   return interaction.user.id == MY_DISCORD_ID
 
 
@@ -865,9 +865,21 @@ async def buy_stock(
     interaction: discord.Interaction, stock_name: str, count: int = 1
 ):
   global stock_market_force_closed
+
+  # 1. 관리자에 의해 주식 시장이 차단된 경우 매수 불가
   if stock_market_force_closed:
     await interaction.response.send_message(
         "❌ 현재 관리자에 의해 **주식 시장이 긴급 차단**되어 매수할 수 없습니다!",
+        ephemeral=True,
+    )
+    return
+
+  # 2. 새벽 시간대(00:00~07:00 KST) 시세가 고정되어 거래 불가
+  kst = pytz.timezone("Asia/Seoul")
+  current_hour = datetime.now(kst).hour
+  if 0 <= current_hour < 7:
+    await interaction.response.send_message(
+        "❌ **시장 휴장 시간(00:00~07:00)**에는 주식 거래(매수)를 하실 수 없습니다!",
         ephemeral=True,
     )
     return
@@ -920,6 +932,26 @@ async def buy_stock(
 async def sell_stock(
     interaction: discord.Interaction, stock_name: str, count: int = 1
 ):
+  global stock_market_force_closed
+
+  # 1. 관리자에 의해 주식 시장이 차단된 경우 매도 불가
+  if stock_market_force_closed:
+    await interaction.response.send_message(
+        "❌ 현재 관리자에 의해 **주식 시장이 긴급 차단**되어 매도할 수 없습니다!",
+        ephemeral=True,
+    )
+    return
+
+  # 2. 새벽 시간대(00:00~07:00 KST) 시세가 고정되어 거래 불가
+  kst = pytz.timezone("Asia/Seoul")
+  current_hour = datetime.now(kst).hour
+  if 0 <= current_hour < 7:
+    await interaction.response.send_message(
+        "❌ **시장 휴장 시간(00:00~07:00)**에는 주식 거래(매도)를 하실 수 없습니다!",
+        ephemeral=True,
+    )
+    return
+
   if stock_name not in stock_data:
     await interaction.response.send_message("❌ 존재하지 않는 주식입니다.")
     return
