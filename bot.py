@@ -145,13 +145,28 @@ def update_user_points(user_id, amount):
 
 
 # -------------------------------------------------------------
-# 👑 [최고 권한 체크] 오직 '나(개발자)' 단 한 사람만 승인하는 함수
+# 👑 [최고 권한 체크] 개발자, 서버 소유자, 또는 등록된 봇 관리자 승인
 # -------------------------------------------------------------
 MY_DISCORD_ID = 1030754198796632135  # 본인의 디스코드 사용자 ID
 
 
 def is_bot_admin_check(interaction: discord.Interaction) -> bool:
-  return interaction.user.id == MY_DISCORD_ID
+  user_id = interaction.user.id
+
+  # 1. 개발자 본인 ID인 경우
+  if user_id == MY_DISCORD_ID:
+    return True
+  
+  # 2. 현재 서버의 서버장(Owner)인 경우
+  if interaction.guild and interaction.guild.owner_id == user_id:
+    return True
+    
+  # 3. data['bot_admins'] 리스트에 등록된 관리자인 경우
+  bot_admins = data.get("bot_admins", [])
+  if user_id in bot_admins or str(user_id) in [str(admin) for admin in bot_admins]:
+    return True
+
+  return False
 
 
 # --- 전역 상태 데이터 ---
@@ -180,6 +195,9 @@ DEFAULT_STOCK_PRICES = {
     "SK다우닉스": 300000,
     "야건식품": 3000,
     "야멧돼농협": 50000,
+    "변기아 자동차": 10000000,
+    "야무진학원": 1000,
+    "아랍어학원": 10000000,
 }
 
 stock_data = {
@@ -200,6 +218,24 @@ stock_data = {
         "status": "normal",
         "resume_time": 0,
         "history": [50000],
+    },
+    "변기아 자동차": {
+        "price": 10000000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [10000000],
+    },
+    "야무진학원": {
+        "price": 1000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [1000],
+    },
+    "아랍어학원": {
+        "price": 10000000,
+        "status": "normal",
+        "resume_time": 0,
+        "history": [100000000],
     },
 }
 
@@ -286,6 +322,60 @@ async def check_reservation_loop():
     next_stock_update_time = time.time() + random.randint(3600, 7200)
 
 
+async def trigger_arabic_stock_event():
+  """아랍어학원 주식 매수/매도시 즉시 호출되는 특수 무작위 변동 시스템"""
+  stock_name = "아랍어학원"
+  stock_info = stock_data[stock_name]
+
+  news_channel_id = os.environ.get("NEWS_CHANNEL_ID")
+  news_channel = None
+  if news_channel_id:
+    news_channel = bot.get_channel(int(news_channel_id))
+
+  # 3% 부도 확률 체크
+  is_bankrupt = random.randint(1, 100) <= 3
+  if is_bankrupt:
+    for user_str, user_stocks_dict in data.get("user_stocks", {}).items():
+      if stock_name in user_stocks_dict:
+        user_stocks_dict[stock_name] = 0
+
+    base_price = DEFAULT_STOCK_PRICES.get(stock_name, 10000000)
+    stock_info["status"] = "bankrupt"
+    stock_info["resume_time"] = time.time() + 180
+    stock_info["price"] = base_price
+
+    if "history" not in stock_info:
+      stock_info["history"] = []
+    stock_info["history"].append(base_price)
+    if len(stock_info["history"]) > 24:
+      stock_info["history"].pop(0)
+
+    if news_channel:
+      embed = discord.Embed(
+          title=f"🚨 [매수 쇼크] {stock_name} 갑작스러운 파산 선고!",
+          description=(
+              f"매수 수급 변동으로 인해 **{stock_name}**이(가) 결국 **부도**"
+              " 처리되었습니다!\n\n💥 **주주들의 보유 주식과 투자금은 전액 손실되었습니다.**\n⏱️ **3분간 거래가 정지**되며, 이후 기준 최저가({base_price:,}원)로 재상장됩니다."
+          ),
+          color=0xFF0000,
+      )
+      await news_channel.send(embed=embed)
+  else:
+    # 매수로 인한 주가 변동 (-10% ~ +20%)
+    change_rate = random.uniform(-0.10, 0.20)
+    old_price = stock_info["price"]
+    new_price = max(100, int(old_price * (1 + change_rate)))
+    stock_info["price"] = new_price
+
+    if "history" not in stock_info:
+      stock_info["history"] = []
+    stock_info["history"].append(new_price)
+    if len(stock_info["history"]) > 24:
+      stock_info["history"].pop(0)
+
+  save_data(data)
+
+
 async def trigger_random_stock_event():
   global stock_data, stock_market_force_closed
   if stock_market_force_closed:
@@ -313,6 +403,10 @@ async def trigger_random_stock_event():
   is_night_fluctuation = current_hour >= 21 or current_hour < 8
 
   for stock_name, stock_info in stock_data.items():
+    # 아랍어학원은 일반 자동 이벤트 수급에서 제외 (매수 시 동작)
+    if stock_name == "아랍어학원":
+      continue
+
     if stock_info.get("status") == "bankrupt":
       if time.time() < stock_info.get("resume_time", 0):
         continue
@@ -342,12 +436,17 @@ async def trigger_random_stock_event():
         )
         await news_channel.send(embed=embed)
     else:
+      # 각 종목별 부도 확률 설정
       if stock_name == "SK다우닉스":
-        bankruptcy_chance = 5
-      elif stock_name == "야멧돼농협":
         bankruptcy_chance = 10
-      elif stock_name == "야건식품":
+      elif stock_name == "야멧돼농협":
         bankruptcy_chance = 15
+      elif stock_name == "야건식품":
+        bankruptcy_chance = 20
+      elif stock_name == "변기아 자동차":
+        bankruptcy_chance = 3
+      elif stock_name == "야무진학원":
+        bankruptcy_chance = 1
       else:
         bankruptcy_chance = 10
 
@@ -358,7 +457,6 @@ async def trigger_random_stock_event():
           if stock_name in user_stocks_dict:
             user_stocks_dict[stock_name] = 0
 
-        # 부도시 해당 주식의 원래 기준 최저가로 설정
         base_price = DEFAULT_STOCK_PRICES.get(stock_name, 1000)
 
         stock_info["status"] = "bankrupt"
@@ -384,7 +482,13 @@ async def trigger_random_stock_event():
           )
           await news_channel.send(embed=embed)
       else:
-        increase_rate = random.uniform(0.10, 0.60)
+        # 각 종목별 폭등 상한선 설정
+        if stock_name == "야무진학원":
+          max_rate = 0.30  # 최대 30% 폭등
+        else:
+          max_rate = 0.60  # 최대 60% 폭등
+
+        increase_rate = random.uniform(0.10, max_rate)
         old_price = stock_info["price"]
         new_price = int(old_price * (1 + increase_rate))
         stock_info["price"] = new_price
@@ -432,11 +536,11 @@ async def on_ready():
 # ==========================================
 # 👑 봇 관리자 지정 명령어 (개발자 전용)
 # ==========================================
-@bot.tree.command(name="봇관리자추가", description="[개발자 전용] 봇 관리자를 추가합니다.")
+@bot.tree.command(name="봇관리자추가", description="[관리자 전용] 봇 관리자를 추가합니다.")
 async def add_bot_admin(interaction: discord.Interaction, member: discord.Member):
   if not is_bot_admin_check(interaction):
     await interaction.response.send_message(
-        "❌ 이 명령어는 **개발자(본인)**만 사용할 수 있습니다!", ephemeral=True
+        "❌ 이 명령어는 **봇 관리자**만 사용할 수 있습니다!", ephemeral=True
     )
     return
 
@@ -453,27 +557,41 @@ async def add_bot_admin(interaction: discord.Interaction, member: discord.Member
   )
 
 
-@bot.tree.command(name="봇관리자삭제", description="[개발자 전용] 봇 관리자를 해제합니다.")
+@bot.tree.command(name="봇관리자삭제", description="[관리자 전용] 봇 관리자를 해제합니다.")
 async def remove_bot_admin(
     interaction: discord.Interaction, member: discord.Member
 ):
   if not is_bot_admin_check(interaction):
     await interaction.response.send_message(
-        "❌ 이 명령어는 **개발자(본인)**만 사용할 수 있습니다!", ephemeral=True
+        "❌ 이 명령어는 **봇 관리자**만 사용할 수 있습니다!", ephemeral=True
     )
     return
 
-  if member.id not in data["bot_admins"]:
+  is_owner = interaction.guild and interaction.guild.owner_id == member.id
+  if member.id == MY_DISCORD_ID or is_owner:
     await interaction.response.send_message(
-        f"⚠️ {member.mention}님은 봇 관리자가 아닙니다."
+        f"❌ {member.mention}님은 **서버 소유자(또는 개발자)**이므로 관리자 권한을 해제할 수 없습니다!",
+        ephemeral=True
     )
     return
 
-  data["bot_admins"].remove(member.id)
-  save_data(data)
-  await interaction.response.send_message(
-      f"🗑️ {member.mention}님의 **봇 관리자** 권한이 해제되었습니다."
-  )
+  bot_admins = data.get("bot_admins", [])
+  target_matched = None
+  for admin in bot_admins:
+    if int(admin) == member.id:
+      target_matched = admin
+      break
+
+  if target_matched is not None:
+    bot_admins.remove(target_matched)
+    save_data(data)
+    await interaction.response.send_message(
+        f"🗑️ {member.mention}님의 **봇 관리자** 권한이 해제되었습니다."
+    )
+  else:
+    await interaction.response.send_message(
+        f"⚠️ {member.mention}님은 봇 관리자 목록에 없습니다.", ephemeral=True
+    )
 
 
 @bot.tree.command(name="봇관리자목록", description="등록된 봇 관리자 목록을 조회합니다.")
@@ -811,8 +929,7 @@ async def show_stock_market(interaction: discord.Interaction):
   embed = discord.Embed(
       title="📈 실시간 포인트 주식 시장",
       description=(
-          "1~2시간마다 랜덤 대폭등 및 부도(SK다우닉스 5%, 야멧돼농협 10%,"
-          " 야건식품 15%)가 판가름 납니다!"
+          "다양한 기업의 실시간 주식 변동과 부도 리스크를 확인하세요!"
       ),
       color=discord.Color.green(),
   )
@@ -931,6 +1048,10 @@ async def buy_stock(
       f"📈 **{stock_name}** {count}주 매수 완료! (총 비용: **{total_cost:,}P**)"
   )
 
+  # 📌 아랍어학원 주식 특수 트리거: 매수 거래 발생 시 주가 변동 트리거 작동
+  if stock_name == "아랍어학원":
+    asyncio.create_task(trigger_arabic_stock_event())
+
 
 @bot.tree.command(name="주식매도", description="주식을 지정 수량만큼 매도합니다.")
 async def sell_stock(
@@ -979,6 +1100,10 @@ async def sell_stock(
   await interaction.response.send_message(
       f"📉 **{stock_name}** {count}주 매도 완료! (획득 금액: **{total_earn:,}P**)"
   )
+
+  # 📌 아랍어학원 주식 특수 트리거: 매도 거래 발생 시 주가 변동 트리거 작동
+  if stock_name == "아랍어학원":
+    asyncio.create_task(trigger_arabic_stock_event())
 
 
 @bot.tree.command(name="내주식", description="내 보유 주식 포트폴리오를 조회합니다.")
