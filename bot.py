@@ -232,10 +232,10 @@ stock_data = {
         "history": [1000],
     },
     "아랍어학원": {
-        "price": 10000000,
+        "price": 100000000,
         "status": "normal",
         "resume_time": 0,
-        "history": [100000000],
+        "history": [10000000],
     },
 }
 
