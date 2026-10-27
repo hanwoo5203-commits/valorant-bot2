@@ -552,7 +552,6 @@ async def on_ready():
   if not check_reservation_loop.is_running():
     check_reservation_loop.start()
 
-
 # ==========================================
 # 👑 봇 관리자 지정 명령어
 # ==========================================
@@ -903,7 +902,7 @@ async def gamble(
     return
 
   win_rates = {
-      2: 44.0,
+      2: 50.0,
       3: 30.0,
       4: 19.0,
       5: 5.0,
